@@ -1,0 +1,10 @@
+---
+title: Exercise Report
+output: html_document
+---
+
+```{r setup, echo = FALSE, include = FALSE}
+# packages (load all the needed packages here with library())
+
+source("R/functions.R")
+```
