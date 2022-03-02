@@ -3,8 +3,214 @@ title: Exercise Report
 output: html_document
 ---
 
+
+
 ```{r setup, echo = FALSE, include = FALSE}
 # packages (load all the needed packages here with library())
-
+library(knitr)
+library(rmarkdown)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(edgeR)
+library(limma)
+library(gplots)
+library(RColorBrewer)
+library(textshape)
+library(ggfortify)
+library(magrittr)
 source("R/functions.R")
+```
+
+# 1. Preprocess data
+
+## Read files
+```{r}
+#Sample annotation table
+fread("data/sample-annotation.txt",stringsAsFactors = F)->sample_annotation 
+#Gene annotation table
+fread("data/gene-annotation.txt",stringsAsFactors = F)->gene_annotation 
+#Gene-level count table
+fread("data/counts.txt",stringsAsFactors = F)->counts 
+
+```
+
+## Set counts and gene annotation consistency
+```{r}
+select(gene_annotation,1) -> ENSEMBL
+#Filter genes with available annotation only
+merge(counts,ENSEMBL,by.x="V1",by.y="ENSEMBL",all=F) -> counts_filt
+#Convert counts to matrix for better future processing
+counts_filt %>% column_to_rownames("V1")  %>%  as.matrix() -> counts_mat
+```
+
+## Create a DGEList object to store count data
+```{r}
+#Since the downstream analysis is with "edgeR" package, I create a DGEList
+#object to store count data
+DGEList(counts_mat) -> burning_skin_data
+#Update group names
+as.factor(sample_annotation$type) -> burning_skin_data$samples$group 
+#Update annotation
+gene_annotation -> burning_skin_data$genes
+```
+
+
+# 2. Filter data for lowly-expressed genes
+```{r}
+#Determine which genes have sufficiently large counts (>10) to be retained in analysis
+#Since both groups are large, I changed the default parameter of large.n to 95,
+#the size of the large group. The other parameter demands expression in 70% of 
+#the samples in each group.
+filterByExpr(burning_skin_data, large.n = 95) -> keep
+summary(keep) #Print statistics of filtered genes
+#Update table with filtered data
+burning_skin_data[keep, , keep.lib.sizes=TRUE] -> burning_skin_data 
+```
+# 3. Object assignment and saving to binary file
+```{r}
+#When using a 'DGEList' object, cpm is useful function for normalization and log transfer. 
+cpm(burning_skin_data, log=TRUE, normalized.lib.sizes = T) -> log_burning_skin_data
+saveRDS(log_burning_skin_data, file = "results/burning_skin_data.rds") #Save to .rds
+
+```
+
+# 4. Plots of main properties of data {.tabset .tabset-fade .tabset-pills}
+
+## library size 
+
+```{r,fig.width=7,fig.height=5}
+#For better presentation, library size are normalized by 1M.
+barplot(burning_skin_data$samples$lib.size/1e06, names=colnames(burning_skin_data), las=2, ann=FALSE, cex.names=0.6)
+title("Barplot of library sizes")
+mtext(side = 2, text = "Library size (millions)", line = 3)
+mtext(side = 1, text = "Samples", line = 4)
+```
+
+## Counts distributions of samples
+
+```{r}
+boxplot(log_burning_skin_data, ylab="Log2 counts per million",las=2, cex.names=0.6, cex.axis=0.65)
+title("Boxplots of logCPMs")
+#Blue line indicates median of counts
+abline(h=median(log_burning_skin_data),col="blue")
+mtext(side = 1, text = "Samples", line = 4)
+```
+
+## MDS plot by condition
+
+```{r}
+c("red","blue")[burning_skin_data$samples$group] -> col_by_group
+plotMDS(log_burning_skin_data,col=col_by_group) 
+legend("bottomleft",legend=levels(burning_skin_data$samples$group), inset=.02, fill=c("red","blue"), horiz=TRUE, cex=0.6,pch = 16)
+title("LogFC by condition")
+```
+
+## Hirarchial clustering with heatmap
+
+```{r,fig.width=7,fig.height=7}
+apply(log_burning_skin_data, 1, var) -> var_genes
+#Select the top 500 varied transcripts
+names(sort(var_genes, decreasing=TRUE))[1:500] -> select_var
+log_burning_skin_data[select_var,] -> highly_variable_lcpm
+#Set colors for heatmap
+brewer.pal(11,"RdYlBu") -> mypalette
+colorRampPalette(mypalette) -> morecols
+c("red","blue")[burning_skin_data$samples$group] -> group_color
+#Plot heatmap
+heatmap.2(highly_variable_lcpm,col=rev(morecols(50)),trace="none", main="Top 500 most variable genes across samples",ColSideColors=group_color,scale="row")
+```
+
+## PCA
+
+```{r,warning=FALSE}
+log_burning_skin_data %>%  as.matrix() %>% t() ->pca_matrix
+#Perform a PC analysis and return the results as an object
+prcomp(pca_matrix) -> sample_pca
+#Plot PCA
+autoplot(sample_pca, data = sample_annotation, colour = 'type')
+```
+
+# 5. Find and remove mislabeled/outlier samples
+#### One sample, SRR1146216, is clearly recognized as mislabeled from the plots
+#### above hence is removed
+```{r}
+burning_skin_data[,which(!rownames(burning_skin_data$samples) == "SRR1146216")] -> burning_skin_data
+```
+
+#### Another way to detect outliers is the criterion of being “more than 6 
+#### standard deviations away from the mean”:
+```{r}
+apply(sample_pca$x, 2, function(x) which( abs(x - mean(x)) > (6 * sd(x)) )) %>%
+  Reduce(union, .) -> outliers_samples
+#Find samples name
+as.data.frame(rownames(burning_skin_data$samples)[outliers_samples]) -> outliers_sample_name
+"samples" -> colnames(outliers_sample_name)
+```
+#### Six samples, SRR1146140, SRR1146186,SRR1146232,SRR1146233,SRR1146085 and 
+#### SRR1146086 are recognized as outliers hence are removed
+```{r}
+#Update matrix after sample removal
+burning_skin_data[,which(!rownames(burning_skin_data$samples) %in% 
+                           outliers_sample_name$samples)] -> burning_skin_data
+#Update matrix after sample removal
+cpm(burning_skin_data, log=TRUE, normalized.lib.sizes = T) -> log_burning_skin_data
+```
+
+
+# 6. Differential expression analysis with limma
+```{r}
+burning_skin_data$samples$group -> group
+#Create a design matrix
+model.matrix(~ 0 + group) -> design
+levels(group) -> colnames(design)
+#The voom approach is more powerful in variable library sizes:
+voom(burning_skin_data,design,plot = F) -> v
+#Fitting a linear model for each gene
+lmFit(v) -> fit 
+#Create pair-wise comparisons matrix
+makeContrasts(NormalVsLesional =normal - lesional ,levels=design) -> cont.matrix
+contrasts.fit(fit, cont.matrix) -> fit.cont
+#Compute empirical Bayes statistics
+eBayes(fit.cont) -> fit.cont
+#Assign the outcome of each hypothesis test
+decideTests(fit.cont) -> summa.fit
+summary(summa.fit)
+#Sort results by p. value
+fit.cont[order(fit.cont$F.p.value),] -> sorted_sig_diff_genes
+```
+# 7. Volcano plot - colored top 100 most DE genes
+```{r}
+volcanoplot(fit.cont,coef=1,highlight=100,names=fit.cont$genes$SYMBOL, main="NormalVsLesional")
+```
+
+# 8. Differential expression wrapped function
+```{r}
+diff_analysis(counts_mat,sample_annotation,c("lesional","normal")) -> stat_df
+stat_df
+```
+
+# 9. Bonus- a function that identifies the outlier based on the expression data and group variable only.
+```{r}
+find_outliers(log_burning_skin_data, sample_annotation) -> outlier_samples
+outlier_samples
+```
+
+# Further analysis
+#### For future research I would suggest the following:
+#### **A.** Focus on a small subset of the genes which change the most.
+#### **B.** Look up in the litrature for known relataion between up/down regulated genes and skin 
+####        marks/diseases/phenotypes.
+#### **C.** Since the majority of diseases are multyfactorial one, perform 'Gene ontology' analysis and find relevant ####        pathway.
+#### **D.** Conduct 'Gene Set Enrichment Analysis (GSEA)' for all genes to find statistically significant pathways.
+#### **E.** Look up in 'Clinvar' archive of reports for a possible relationships among expression variations and    
+####        phenotypes.
+#### **F.** Find additional relevant data of skin disease and compare gene expression. Find for novel expression 
+####        alterations.
+#### **G.** Since the marks appear at daylight time, focuse on genes which up/down regulated during day time.
+
+
+
+```{r}
+#rmarkdown::render("report.Rmd", output_dir = "results")
 ```
